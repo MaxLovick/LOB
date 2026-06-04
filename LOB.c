@@ -3,8 +3,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+typedef enum {
+    ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY,
+    ORDER_MATCHING_ALGORITHM_PRO_RATA
+} OrderMatchingAlgorithm;
+
 typedef struct {
-    void* limit_order_book_reference;
     int64_t price;
     size_t order_index;
     bool is_bid;
@@ -35,6 +39,7 @@ typedef struct {
 } Side;
 
 typedef struct {
+    OrderMatchingAlgorithm order_matching_algorithm;
     int64_t tick_size;
     Side bids;
     Side asks;
@@ -114,7 +119,6 @@ void destroy_side(Side* side) {
 void destroy_limit_order_book(LimitOrderBook* lob) {
     destroy_side(&lob->bids);
     destroy_side(&lob->asks);
-
     lob->tick_size = 0;
 }
 
@@ -259,7 +263,6 @@ OrderReference* add_order_to_limit_order_book(LimitOrderBook* lob, bool is_bid, 
     order->previous_order_index = old_tail;
     order->next_order_index = SIZE_MAX;
     order->reference = malloc(sizeof(OrderReference));
-    order->reference->limit_order_book_reference = lob;
     order->reference->price = price;
     order->reference->order_index = new_tail;
     order->reference->is_bid = is_bid;
@@ -332,9 +335,7 @@ void cancel_order(Side* side, bool is_bid, int64_t price, size_t order_index, in
     }
 }
 
-uint64_t match_market_order_time_price_priority(Side* side, bool is_bid, int64_t tick_size,
-                                                uint64_t quantity, int64_t limit_price,
-                                                bool is_fill_or_kill) {
+uint64_t match_market_order_using_time_price_priority(Side* side, bool is_bid, int64_t tick_size, int64_t limit_price, uint64_t quantity, bool is_fill_or_kill) {
     int64_t direction = is_bid ? 1 : -1;
     uint64_t unfilled_quantity = quantity;
 
@@ -357,7 +358,7 @@ uint64_t match_market_order_time_price_priority(Side* side, bool is_bid, int64_t
         if(available_quantity < unfilled_quantity) { return unfilled_quantity; }
     }
 
-    for(size_t outer = 0; outer < side->capacity; outer++) {
+    for(size_t price_bucket = 0; price_bucket < side->capacity; price_bucket++) {
         if(unfilled_quantity == 0) { break; }
         if(side->best_price_bucket_index == SIZE_MAX) { break; }
         if(direction * (side->best_price - limit_price) < 0) { break; }
@@ -366,7 +367,7 @@ uint64_t match_market_order_time_price_priority(Side* side, bool is_bid, int64_t
         PriceBucket* bucket = &side->price_buckets[best_price_bucket_index];
         uint32_t total_orders_at_start = bucket->total_orders;
 
-        for(uint32_t order_num = 0; order_num < total_orders_at_start; order_num++) {
+        for(uint32_t order = 0; order < total_orders_at_start; order++) {
             if(unfilled_quantity == 0) { break; }
             size_t order_index = bucket->orders_head;
             uint64_t order_quantity = bucket->orders[order_index].quantity;
@@ -413,9 +414,7 @@ uint64_t match_market_order_time_price_priority(Side* side, bool is_bid, int64_t
     return unfilled_quantity;
 }
 
-uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
-                                     uint64_t quantity, int64_t limit_price,
-                                     bool is_fill_or_kill, uint64_t minimum_fill_quantity) {
+uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size, int64_t limit_price, uint64_t quantity, bool is_fill_or_kill, uint64_t minimum_fill_quantity) {
     int64_t direction = is_bid ? 1 : -1;
     uint64_t unfilled_quantity = quantity;
 
@@ -436,7 +435,7 @@ uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
         if(available_quantity < unfilled_quantity) { return unfilled_quantity; }
     }
 
-    for(size_t outer = 0; outer < side->capacity; outer++) {
+    for(size_t price_bucket = 0; price_bucket < side->capacity; price_bucket++) {
         if(unfilled_quantity == 0) { break; }
         if(side->best_price_bucket_index == SIZE_MAX) { break; }
         if(direction * (side->best_price - limit_price) < 0) { break; }
@@ -446,7 +445,6 @@ uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
         uint64_t total_quantity_in_bucket = bucket->total_quantity;
 
         if(total_quantity_in_bucket <= unfilled_quantity) {
-            // Consume the entire bucket
             unfilled_quantity -= total_quantity_in_bucket;
             bucket->total_quantity = 0;
 
@@ -462,7 +460,6 @@ uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
             bucket->total_orders = 0;
         }
         else {
-            // Pro-rata distribution pass
             uint64_t starting_unfilled_quantity = unfilled_quantity;
             uint64_t starting_bucket_quantity = total_quantity_in_bucket;
             uint32_t total_orders_at_start = bucket->total_orders;
@@ -473,9 +470,23 @@ uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
                 size_t next_order_index = bucket->orders[order_index].next_order_index;
                 uint64_t order_quantity = bucket->orders[order_index].quantity;
 
-                // 128-bit intermediate avoids overflow when unfilled * order_qty exceeds 64 bits
-                __uint128_t numerator = (__uint128_t)starting_unfilled_quantity * (__uint128_t)order_quantity;
-                uint64_t fill_quantity = (uint64_t)(numerator / starting_bucket_quantity);
+                uint64_t fill_quantity = 0;
+                uint64_t running_remainder = 0;
+                for(size_t bit = 64; bit-- > 0; ) {
+                    fill_quantity += fill_quantity;
+                    running_remainder += running_remainder;
+                    if(running_remainder >= starting_bucket_quantity) {
+                        running_remainder -= starting_bucket_quantity;
+                        fill_quantity += 1;
+                    }
+                    if((order_quantity >> bit) & 1) {
+                        running_remainder += starting_unfilled_quantity;
+                        if(running_remainder >= starting_bucket_quantity) {
+                            running_remainder -= starting_bucket_quantity;
+                            fill_quantity += 1;
+                        }
+                    }
+                }
                 if(fill_quantity < minimum_fill_quantity) { fill_quantity = 0; }
                 if(fill_quantity > order_quantity) { fill_quantity = order_quantity; }
 
@@ -504,7 +515,6 @@ uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
                 order_index = next_order_index;
             }
 
-            // FIFO leftover pass
             uint32_t orders_remaining = bucket->total_orders;
             for(uint32_t order_num = 0; order_num < orders_remaining; order_num++) {
                 if(unfilled_quantity == 0) { break; }
@@ -552,4 +562,22 @@ uint64_t match_market_order_pro_rata(Side* side, bool is_bid, int64_t tick_size,
     }
 
     return unfilled_quantity;
+}
+
+OrderReference* execute_order(LimitOrderBook* lob, bool is_bid, int64_t price, uint64_t quantity, bool is_fill_or_kill, uint64_t minimum_fill_quantity) {
+    Side* opposite_side = is_bid ? &lob->asks : &lob->bids;
+    bool opposite_is_bid = !is_bid;
+
+    uint64_t unfilled_quantity;
+    if(lob->order_matching_algorithm == ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY) {
+        unfilled_quantity = match_market_order_using_time_price_priority(opposite_side, opposite_is_bid, lob->tick_size, price, quantity, is_fill_or_kill);
+    }
+    if(lob->order_matching_algorithm == ORDER_MATCHING_ALGORITHM_PRO_RATA) {
+        unfilled_quantity = match_market_order_pro_rata(opposite_side, opposite_is_bid, lob->tick_size, price, quantity, is_fill_or_kill, minimum_fill_quantity);
+    }
+
+    if(unfilled_quantity == 0) { return NULL; }
+    if(is_fill_or_kill) { return NULL; }
+
+    return add_order_to_limit_order_book(lob, is_bid, price, unfilled_quantity);
 }
