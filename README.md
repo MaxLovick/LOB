@@ -90,32 +90,6 @@ gcc -O2 quickstart.c -o quickstart && ./quickstart
 
 The matching algorithm is selected per book via `lob.order_matching_algorithm`, set to either `ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY` or `ORDER_MATCHING_ALGORITHM_PRO_RATA`. In pro-rata mode, `execute_order`'s `minimum_fill_quantity` argument sets the per-order floor before the FIFO leftover pass distributes the rounding remainder.
 
-## Benchmarks
-
-Compared against [JAX-LOB](https://arxiv.org/abs/2308.13289), a JAX-based order book built for GPU-batched RL training. Both engines were run on the same machine: a single core of an Intel Xeon @ 2.80 GHz, no GPU. `lob.c` was built with `gcc -O2`; JAX was 0.10.0 on CPU.
-
-This is a CPU comparison, and it is deliberately *not* the workload JAX-LOB was designed for (batching thousands of independent books on a GPU). The single-book numbers show the cost of JAX dispatch and array scans with nothing to amortize them against — which is exactly the regime this library targets.
-
-**Single book, single thread, CPU:**
-
-| Scenario | `lob.c` (ns/op) | JAX-LOB (ns/op) | Ratio |
-|---|---:|---:|---:|
-| add + cancel pair (warm book) | 17 | 100K – 165K | ~5,900x – 9,700x |
-| add only | 330 | 123K | ~370x |
-| FIFO match, per resting order consumed | 9 – 13 | 407 – 1,088 | ~40x – 100x |
-| pro-rata, 100 orders @ one level | 370 | — | — |
-| mixed (47% add / 48% cancel / 5% match) | 73 | — | — |
-| deep add: 50K orders to one bucket (per add) | 140 | — | — |
-
-**vmap batching (JAX-LOB's intended use case, still on CPU):**
-
-| Batch | nOrders | Per-event amortized | Events/sec |
-|---:|---:|---:|---:|
-| 256 | 128 | 23,211 ns | 43,000 |
-| 1024 | 128 | 40,564 ns | 25,000 |
-
-Even amortized across 1,024 parallel books, JAX-LOB on CPU is roughly 2,400x slower per event than the C engine on a single book. On a GPU that dispatch overhead largely vanishes and batched throughput closes the gap — that is the regime JAX-LOB targets and where it is likely to win for RL training on large numbers of parallel environments. This library bets on the opposite end: a few books, stepped as fast as a single core allows.
-
 ## Roadmap
 
 - Include normal size statistics, so the book grows and shrinks adaptively for better memory use and performance.
@@ -125,6 +99,33 @@ Even amortized across 1,024 parallel books, JAX-LOB on CPU is roughly 2,400x slo
 - Save/restore, for warm-starting RL episodes from a stored book state.
 - A [LOBSTER](https://lobsterdata.com/) message-file driver for replay.
 - A synthetic order-flow simulator driven by Hawkes processes.
+
+# Benchmarks
+ 
+Compared against [JAX-LOB](https://github.com/KangOxford/AlphaTrade), a JAX-based order
+book built for GPU-batched RL training. Both engines ran on the same machine: a single
+core of an Intel Xeon @ 2.80 GHz, no GPU. `lob.c` was built with `gcc -O2`; JAX-LOB ran
+on JAX 0.10.1 (CPU). This is a CPU comparison and is deliberately **not** the workload
+JAX-LOB was designed for (batching thousands of books on a GPU).
+ 
+JAX-LOB is measured two ways, at batch sizes 1 / 256 / 512 / 1028:
+ 
+* **normal** -- no vmap: the books are processed one at a time (a plain Python loop of
+  single-book calls). Per-event cost is ~independent of batch; total time scales with B.
+* **vmap** -- `jax.vmap` across all B books in one vectorised call.
+Each `lob.c` number is the median of 3 isolated runs (own process). Each JAX number is the
+per-event average over 100 vmapped iterations (normal mode averaged over a few thousand
+single-book calls). The ratio after every JAX cell is **how many times faster `lob.c` is**
+for that operation. Units per row: add/deep-add = ns per order; add+cancel = ns per pair;
+FIFO match = ns per resting order consumed; pro-rata = ns per match call.
+ 
+| Scenario | lob.c (ns) | JAX-LOB batch size=1 | speed up | JAX-LOB batch size=256 | speed up | JAX-LOB batch size=512 | speed up | JAX-LOB batch size=1028 | speed up | vmap B=1 | speed up | vmap B=256 | speed up | vmap B=512 | speed up | vmap B=1028 | speed up |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| add only | 72 | 219,697 | 3,045x | 165,054 | 2,288x | 158,127 | 2,192x | 168,136 | 2,330x | 213,464 | 2,959x | 33,234 | 461x | 33,122 | 459x | 54,200 | 751x |
+| deep add (deep book) | 489 | 643,446 | 1,315x | 615,486 | 1,258x | 586,207 | 1,198x | 596,267 | 1,218x | 636,946 | 1,302x | 1,003,829 | 2,051x | 1,028,403 | 2,101x | 1,061,095 | 2,168x |
+| add + cancel (per pair) | 51 | 385,574 | 7,548x | 343,249 | 6,720x | 359,585 | 7,040x | 350,087 | 6,854x | 381,658 | 7,472x | 63,285 | 1,239x | 71,491 | 1,400x | 109,169 | 2,137x |
+| FIFO match (per resting order) | 15 | 2,291 | 158x | 1,703 | 117x | 1,779 | 123x | 1,811 | 125x | 3,095 | 213x | 425 | 29x | 425 | 29x | 662 | 46x |
+| pro-rata (per match call) | 10,134 | n/a (not in JAX-LOB) | - | n/a | - | n/a | - | n/a | - | n/a | - | n/a | - | n/a | - | n/a | - |
 
 ## Research directions
 
