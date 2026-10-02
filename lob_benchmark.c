@@ -1,7 +1,71 @@
+/*
+ * bench_lob.c -- benchmark harness for lob.c (trader-account API).
+ *
+ * Every scenario reproduces the exact book state used by the matching JAX-LOB
+ * scenario in bench_jax.py, so the per-event numbers compare like with like:
+ *
+ *   add_only    64 resting bids on 64 levels (1,000,000 - r), add 1 bid @ 999,970
+ *   add_new_lvl same book, add 1 bid @ 999,900 (outside range -> side resize)
+ *   deep_add    1024 resting bids on 1024 levels,             add 1 bid @ 999,900
+ *   add_cancel  same book as add_only, add 1 bid @ 999,970 then cancel (per pair)
+ *   fifo_match  100 resting asks of qty 1 at ONE level, buy 1 crossing it
+ *               (one incoming order filling one resting order)
+ *   fifo_sweep  same book, buy 100 sweeping all of it (per resting order consumed).
+ *               lob.c only: JAX-LOB's matcher stops after the first fill.
+ *   prorata     100 asks of qty 10..99 at one level, consume ~half (per call)
+ *
+ * Like JAX-LOB's "normal" mode, NBOOKS independent books are prefilled (untimed)
+ * and then the operation is applied to each book in a plain loop (timed).
+ *
+ * Output: one CSV line per scenario:
+ *   name,ns_per_event,bytes_per_book_after,heap_bytes_leaked_per_book
+ *
+ * Memory accounting wraps malloc/free so we see exactly what lob.c allocates.
+ */
+#define _GNU_SOURCE
+#include <malloc.h>
 #include <stdio.h>
-#include <time.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* ---- heap tracking (must come before lob.c is included) ---- */
+static long long g_live_bytes = 0;
+static void* tracked_malloc(size_t n) {
+    void* p = malloc(n);
+    if (p) g_live_bytes += (long long)malloc_usable_size(p);
+    return p;
+}
+static void tracked_free(void* p) {
+    if (p) g_live_bytes -= (long long)malloc_usable_size(p);
+    free(p);
+}
+#define malloc tracked_malloc
+#define free   tracked_free
+#define main   lob_c_builtin_main   /* lob.c ships its own main() */
 #include "lob.c"
+#undef main
+#undef malloc
+#undef free
+
+/* Bytes the book has asked for, computed from its capacities (no allocator overhead). */
+static size_t lob_footprint_bytes(const LimitOrderBook* lob) {
+    size_t total = sizeof(LimitOrderBook);
+    const LimitOrderBook_Side* sides[2] = { &lob->bids, &lob->asks };
+    for (int s = 0; s < 2; s++) {
+        const LimitOrderBook_Side* side = sides[s];
+        total += side->price_buckets_capacity * sizeof(LimitOrderBook_PriceBucket);
+        for (size_t i = 0; i < side->price_buckets_capacity; i++) {
+            const LimitOrderBook_PriceBucket* b = &side->price_buckets[i];
+            if (b->orders)           total += b->orders_capacity * sizeof(uint64_t);
+            if (b->order_references) total += b->order_references_capacity * sizeof(LimitOrderBook_OrderReference);
+        }
+    }
+    total += lob->total_trader_accounts * sizeof(LimitOrderBook_TraderAccount);
+    for (size_t i = 0; i < lob->total_trader_accounts; i++)
+        total += lob->trader_accounts[i].order_references_capacity * sizeof(LimitOrderBook_OrderReference*);
+    return total;
+}
 
 static inline double now_ns(void) {
     struct timespec ts;
@@ -9,186 +73,132 @@ static inline double now_ns(void) {
     return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
 }
 
-/* construct_limit_order_book does not set the algorithm field, so do it here. */
-static LimitOrderBook make_book(OrderMatchingAlgorithm algo, int64_t tick) {
-    LimitOrderBook lob = construct_limit_order_book(tick);
-    lob.tick_size = tick;
-    lob.order_matching_algorithm = algo;
-    return lob;
-}
+#define NBOOKS 64   /* small enough that prefilled books are still warm in cache, like JAX's reused state0 */
+#define BASE   1000000
+#define PREFILL_ACCOUNT 0
+#define AGENT_ACCOUNT   1
 
-/* ---------- 1. add + cancel pair, warm book ---------- */
-double bench_add_cancel_warm(long pairs) {
-    LimitOrderBook lob = make_book(ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY, 1);
-    /* Warm the book: resting orders across a band, and 10 resting at the target level
-       so total_orders never drops to 0 during the measured loop (no best/worst recompute). */
-    int64_t base = 1000000;
-    for (int64_t p = base - 50; p <= base + 50; p++)
-        add_order_to_limit_order_book(&lob, true, p, 5);
-    for (int i = 0; i < 10; i++)
-        add_order_to_limit_order_book(&lob, true, base, 5);
+typedef struct { double ns; size_t bytes; long long leaked; } Result;
 
-    double t0 = now_ns();
-    for (long i = 0; i < pairs; i++) {
-        OrderReference* ref = add_order_to_limit_order_book(&lob, true, base, 7);
-        cancel_order(&lob.bids, true, ref->price, ref->order_index, lob.tick_size);
-    }
-    double t1 = now_ns();
-    destroy_limit_order_book(&lob);
-    return (t1 - t0) / (double)pairs;
-}
+/* Run `reps` rounds; each round prefills NBOOKS books, times op() over them. */
+typedef void (*PrefillFn)(LimitOrderBook*);
+typedef void (*OpFn)(LimitOrderBook*);
 
-/* ---------- 2. add only (across a band of levels) ---------- */
-double bench_add_only(long n) {
-    /* Re-create a fresh book in batches so memory stays bounded; time only the adds. */
-    long batch = 200000;
-    double total_ns = 0; long done = 0;
-    int64_t base = 1000000;
-    while (done < n) {
-        long this_batch = (n - done < batch) ? (n - done) : batch;
-        LimitOrderBook lob = make_book(ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY, 1);
+static Result run(PrefillFn prefill, OpFn op, int reps, double events_per_op) {
+    static LimitOrderBook books[NBOOKS];
+    double total = 0;
+    Result r = {0};
+    for (int rep = 0; rep < reps; rep++) {
+        long long heap_before = g_live_bytes;
+        for (int b = 0; b < NBOOKS; b++) { books[b] = create_limit_order_book(); prefill(&books[b]); }
         double t0 = now_ns();
-        for (long i = 0; i < this_batch; i++) {
-            int64_t p = base + (i % 100) - 50;   /* spread across 100 levels */
-            add_order_to_limit_order_book(&lob, true, p, 3);
-        }
+        for (int b = 0; b < NBOOKS; b++) op(&books[b]);
         double t1 = now_ns();
-        total_ns += (t1 - t0);
-        destroy_limit_order_book(&lob);
-        done += this_batch;
+        total += t1 - t0;
+        r.bytes = lob_footprint_bytes(&books[0]);
+        for (int b = 0; b < NBOOKS; b++) destroy_limit_order_book(&books[b]);
+        r.leaked = (g_live_bytes - heap_before) / NBOOKS;
     }
-    return total_ns / (double)n;
+    r.ns = total / ((double)reps * NBOOKS * events_per_op);
+    return r;
 }
 
-/* ---------- 3. FIFO match, per resting order consumed ---------- */
-double bench_fifo_match_per_order(long resting_per_iter, long iters) {
-    double total_ns = 0; long total_consumed = 0;
-    for (long it = 0; it < iters; it++) {
-        LimitOrderBook lob = make_book(ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY, 1);
-        int64_t px = 1000000;
-        for (long i = 0; i < resting_per_iter; i++)
-            add_order_to_limit_order_book(&lob, false, px, 1); /* resting asks, qty 1 each */
-        /* Buyer crossing: opposite side = asks, opposite_is_bid = false. */
+/* ---- prefills (mirror bench_jax.py build_state) ---- */
+static void prefill_bids_64(LimitOrderBook* lob) {
+    for (int r = 0; r < 64; r++)
+        add_order_to_limit_order_book(lob, PREFILL_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - r, 10);
+    /* make sure the agent account exists before timing */
+    add_order_to_limit_order_book(lob, AGENT_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - 63, 1);
+}
+static void prefill_bids_1024(LimitOrderBook* lob) {
+    for (int r = 0; r < 1024; r++)
+        add_order_to_limit_order_book(lob, PREFILL_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - r, 10);
+    add_order_to_limit_order_book(lob, AGENT_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - 1023, 1);
+}
+static void prefill_asks_100_one_level(LimitOrderBook* lob) {
+    for (int r = 0; r < 100; r++)
+        add_order_to_limit_order_book(lob, PREFILL_ACCOUNT, LIMIT_ORDER_BOOK_ASK, BASE, 1);
+}
+static void prefill_prorata(LimitOrderBook* lob) {
+    for (int r = 0; r < 100; r++)
+        add_order_to_limit_order_book(lob, PREFILL_ACCOUNT, LIMIT_ORDER_BOOK_ASK, BASE, 10 + (uint64_t)(r % 90));
+}
+
+/* ---- timed ops ---- */
+/* existing level inside the book's price range */
+static void op_add(LimitOrderBook* lob) {
+    add_order_to_limit_order_book(lob, AGENT_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - 30, 10);
+}
+/* new level 100 ticks from best: outside a 64-level book, forces the side to grow */
+static void op_add_new_level(LimitOrderBook* lob) {
+    add_order_to_limit_order_book(lob, AGENT_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - 100, 10);
+}
+static void op_add_cancel(LimitOrderBook* lob) {
+    add_order_to_limit_order_book(lob, AGENT_ACCOUNT, LIMIT_ORDER_BOOK_BID, BASE - 30, 10);
+    size_t idx = lob->trader_accounts[AGENT_ACCOUNT].order_references_tail_index;
+    cancel_order_in_limit_order_book(lob, AGENT_ACCOUNT, idx);
+}
+static void op_fifo_single(LimitOrderBook* lob) {
+    uint64_t left = match_limit_order_book_order_using_time_price_priority(lob, LIMIT_ORDER_BOOK_ASK, BASE, 1);
+    if (left != 0) { fprintf(stderr, "fifo: expected fill\n"); exit(1); }
+}
+static void op_fifo(LimitOrderBook* lob) {
+    /* buyer crosses the ask side: pass the resting side's direction */
+    uint64_t left = match_limit_order_book_order_using_time_price_priority(lob, LIMIT_ORDER_BOOK_ASK, BASE, 100);
+    if (left != 0) { fprintf(stderr, "fifo: expected full fill, %llu left\n", (unsigned long long)left); exit(1); }
+}
+static void op_prorata(LimitOrderBook* lob) {
+    uint64_t total = lob->asks.price_buckets[lob->asks.best_price_bucket_index].total_quantity;
+    match_limit_order_book_order_using_pro_rata(lob, LIMIT_ORDER_BOOK_ASK, BASE, total / 2);
+}
+
+/* ---- scaling probe: cost of one add as one account's resting order count grows ---- */
+static void scaling(void) {
+    long sizes[] = {1000, 2000, 4000, 8000, 16000};
+    for (int s = 0; s < 5; s++) {
+        long n = sizes[s];
+        LimitOrderBook lob = create_limit_order_book();
         double t0 = now_ns();
-        match_market_order_using_time_price_priority(&lob.asks, false, lob.tick_size,
-                                                     px, (uint64_t)resting_per_iter, false);
+        for (long i = 0; i < n; i++)  /* spread over 100 levels, one account */
+            add_order_to_limit_order_book(&lob, 0, LIMIT_ORDER_BOOK_BID, BASE - (i % 100), 1);
         double t1 = now_ns();
-        total_ns += (t1 - t0);
-        total_consumed += resting_per_iter;
+        /* consume everything with one FIFO sweep */
+        double t2 = now_ns();
+        match_limit_order_book_order_using_time_price_priority(&lob, LIMIT_ORDER_BOOK_BID, BASE - 99, (uint64_t)n);
+        double t3 = now_ns();
+        printf("scaling,%ld,%.1f,%.1f,%zu\n", n, (t1 - t0) / n, (t3 - t2) / n, lob_footprint_bytes(&lob));
         destroy_limit_order_book(&lob);
     }
-    return total_ns / (double)total_consumed;
 }
 
-/* ---------- 4. pro-rata, N orders @ one level (per match call) ---------- */
-double bench_prorata_one_level(long orders_at_level, long iters) {
-    double total_ns = 0;
-    for (long it = 0; it < iters; it++) {
-        LimitOrderBook lob = make_book(ORDER_MATCHING_ALGORITHM_PRO_RATA, 1);
-        int64_t px = 1000000;
-        uint64_t total_q = 0;
-        for (long i = 0; i < orders_at_level; i++) {
-            uint64_t q = 10 + (uint64_t)(i % 90); /* varied sizes */
-            add_order_to_limit_order_book(&lob, false, px, q);
-            total_q += q;
-        }
-        uint64_t incoming = total_q / 2; /* consume ~half so pro-rata branch runs */
-        double t0 = now_ns();
-        match_market_order_pro_rata(&lob.asks, false, lob.tick_size, px, incoming, false, 1);
-        double t1 = now_ns();
-        total_ns += (t1 - t0);
+/* ---- memory-only probe: footprint vs resting orders (book grows with use) ---- */
+static void memory_curve(void) {
+    long sizes[] = {0, 1, 64, 1024, 2048};
+    for (int s = 0; s < 5; s++) {
+        LimitOrderBook lob = create_limit_order_book();
+        for (long r = 0; r < sizes[s]; r++)
+            add_order_to_limit_order_book(&lob, 0, LIMIT_ORDER_BOOK_BID, BASE - r, 10);
+        printf("memory,%ld,%zu\n", sizes[s], lob_footprint_bytes(&lob));
         destroy_limit_order_book(&lob);
     }
-    return total_ns / (double)iters;
-}
-
-/* ---------- 5. mixed: 47% add / 48% cancel / 5% match ---------- */
-double bench_mixed(long ops) {
-    LimitOrderBook lob = make_book(ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY, 1);
-    int64_t base = 1000000;
-    /* seed liquidity on both sides */
-    size_t cap = 200000;
-    OrderReference** live = malloc(cap * sizeof(OrderReference*));
-    size_t live_n = 0;
-    for (int i = 0; i < 2000; i++) {
-        int64_t p = base + (i % 50) - 25;
-        live[live_n++] = add_order_to_limit_order_book(&lob, true, p - 100, 5);
-        live[live_n++] = add_order_to_limit_order_book(&lob, false, p + 100, 5);
-    }
-    /* Tracked add/cancel orders live far from the touch (base +/- 75..125) so a
-       small marketable order never consumes them. Match liquidity is replenished
-       at base +/- 1 and is NOT tracked in live[], avoiding any use-after-free. */
-    unsigned long rng = 88172645463325252ull;
-    double t0 = now_ns();
-    for (long i = 0; i < ops; i++) {
-        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-        unsigned r = (unsigned)(rng % 100);
-        if (r < 47 || live_n == 0) {                         /* add (tracked, off-touch) */
-            bool bid = (rng >> 8) & 1;
-            int64_t p = base + (int64_t)((rng >> 9) % 50) - 25 + (bid ? -100 : 100);
-            if (live_n < cap)
-                live[live_n++] = add_order_to_limit_order_book(&lob, bid, p, 5);
-        } else if (r < 95) {                                 /* cancel a random live order */
-            size_t idx = (size_t)((rng >> 16) % live_n);
-            OrderReference* ref = live[idx];
-            Side* s = ref->is_bid ? &lob.bids : &lob.asks;
-            cancel_order(s, ref->is_bid, ref->price, ref->order_index, lob.tick_size);
-            live[idx] = live[--live_n];
-        } else {                                             /* small marketable order */
-            bool bid = (rng >> 20) & 1;
-            /* seed near-touch liquidity (untracked), then cross into only that level */
-            if (bid) {
-                add_order_to_limit_order_book(&lob, false, base + 1, 5); /* resting ask */
-                execute_order(&lob, true, base + 50, 3, false, 1);
-            } else {
-                add_order_to_limit_order_book(&lob, true, base - 1, 5);  /* resting bid */
-                execute_order(&lob, false, base - 50, 3, false, 1);
-            }
-        }
-    }
-    double t1 = now_ns();
-    free(live);
-    destroy_limit_order_book(&lob);
-    return (t1 - t0) / (double)ops;
-}
-
-/* ---------- 6. deep add: many orders to one bucket (per add) ---------- */
-double bench_deep_add(long n) {
-    LimitOrderBook lob = make_book(ORDER_MATCHING_ALGORITHM_PRICE_TIME_PRIORITY, 1);
-    int64_t px = 1000000;
-    double t0 = now_ns();
-    for (long i = 0; i < n; i++)
-        add_order_to_limit_order_book(&lob, true, px, 1);
-    double t1 = now_ns();
-    destroy_limit_order_book(&lob);
-    return (t1 - t0) / (double)n;
 }
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    volatile double s = 0; for (int i = 0; i < 1000; i++) s += now_ns();
     const char* which = (argc > 1) ? argv[1] : "all";
-    int all = (strcmp(which, "all") == 0);
-
-    if (all || !strcmp(which, "add_only")) {
-        double v = bench_add_only(2000000);
-        printf("add_only,%.2f\n", v);
-    }
-    if (all || !strcmp(which, "deep_add")) {
-        double v = bench_deep_add(50000);
-        printf("deep_add,%.2f\n", v);
-    }
-    if (all || !strcmp(which, "add_cancel_pair")) {
-        double v = bench_add_cancel_warm(20000000);
-        printf("add_cancel_pair,%.2f\n", v);
-    }
-    if (all || !strcmp(which, "fifo_match_per_resting_order")) {
-        double v = bench_fifo_match_per_order(2000, 5000);
-        printf("fifo_match_per_resting_order,%.2f\n", v);
-    }
-    if (all || !strcmp(which, "prorata_100_orders_one_level")) {
-        double v = bench_prorata_one_level(100, 200000);
-        printf("prorata_100_orders_one_level,%.2f\n", v);
-    }
+    int all = !strcmp(which, "all");
+    Result r;
+#define SCN(name, pre, op, reps, ev) \
+    if (all || !strcmp(which, name)) { r = run(pre, op, reps, ev); \
+        printf("%s,%.2f,%zu,%lld\n", name, r.ns, r.bytes, r.leaked); }
+    SCN("add_only",   prefill_bids_64,            op_add,           3000, 1)
+    SCN("add_new_level", prefill_bids_64,         op_add_new_level, 3000, 1)
+    SCN("deep_add",   prefill_bids_1024,          op_add,             80, 1)
+    SCN("add_cancel", prefill_bids_64,            op_add_cancel,    3000, 1)
+    SCN("fifo_match", prefill_asks_100_one_level, op_fifo_single,   3000, 1)
+    SCN("fifo_sweep", prefill_asks_100_one_level, op_fifo,           800, 100)
+    SCN("prorata",    prefill_prorata,            op_prorata,        800, 1)
+    if (all || !strcmp(which, "scaling")) scaling();
+    if (all || !strcmp(which, "memory"))  memory_curve();
     return 0;
 }
